@@ -17,6 +17,7 @@ from label_studio_converter.utils import (
     parse_config, create_tokens_and_tags, download, get_image_size, get_image_size_and_channels, ensure_dir
 )
 
+from bs4 import BeautifulSoup
 
 logger = logging.getLogger(__name__)
 
@@ -58,6 +59,7 @@ class Converter(object):
                 config_string = config
             self._schema = parse_config(config_string)
 
+        self.config_path = config
         self._data_keys, self._output_tags = self._get_data_keys_and_output_tags(output_tags)
         self._supported_formats = self._get_supported_formats()
 
@@ -162,13 +164,14 @@ class Converter(object):
         inputs = d['data']
         outputs = defaultdict(list)
         for r in result:
-            if r['from_name'] in self._output_tags:
+            if r.get('from_name', '') in self._output_tags:
                 v = deepcopy(r['value'])
                 v['type'] = self._schema[r['from_name']]['type']
                 if 'original_width' in r:
                     v['original_width'] = r['original_width']
                 if 'original_height' in r:
                     v['original_height'] = r['original_height']
+                v['id'] = r['id']
                 outputs[r['from_name']].append(v)
         return {
             'input': inputs,
@@ -250,10 +253,15 @@ class Converter(object):
                     fout.write('{token} -X- _ {tag}\n'.format(token=token, tag=tag))
                 fout.write('\n')
 
-    def convert_to_coco(self, input_data, output_dir, output_image_dir=None, is_dir=True):
+    def convert_to_coco(self, input_data, output_dir, 
+                              output_image_dir=None, is_dir=True,
+                              category_names = None,
+                              category_in_config = False, 
+                              class_mapping = {},
+                              save_name='result.json'):
         self._check_format(Format.COCO)
         ensure_dir(output_dir)
-        output_file = os.path.join(output_dir, 'result.json')
+        output_file = os.path.join(output_dir, save_name)
         if output_image_dir is not None:
             ensure_dir(output_image_dir)
             output_image_dir_rel = output_image_dir
@@ -263,6 +271,19 @@ class Converter(object):
             output_image_dir_rel = 'images'
         images, categories, annotations = [], [], []
         category_name_to_id = {}
+
+        if category_in_config:
+            with open(self.config_path, 'r') as fp:
+                soup = BeautifulSoup(fp, 'xml')
+            category_names = [ele['value'] for ele in soup.find('RectangleLabels').find_all('Label')]
+
+        if category_names is not None:
+            category_name_to_id = {cat:idx for idx, cat in enumerate(category_names) if cat not in class_mapping}
+            categories = [{"id": idx, "name": cat} for idx, cat in enumerate(category_names) if cat not in class_mapping]
+            category_name_to_id.update(
+                 {cat:category_name_to_id[class_mapping[cat]] for cat in category_names if cat in class_mapping}
+            )
+
         data_key = self._data_keys[0]
         item_iterator = self.iter_from_dir(input_data) if is_dir else self.iter_from_json_file(input_data)
         for item_idx, item in enumerate(item_iterator):
@@ -289,7 +310,7 @@ class Converter(object):
                 'width': width,
                 'height': height,
                 'id': image_id,
-                'file_name': image_path
+                'file_name': os.path.basename(image_path) #'/'.join(image_path.split('/')[-2:])
             })
 
             for bbox in bboxes:
@@ -311,7 +332,7 @@ class Converter(object):
                     'id': annotation_id,
                     'image_id': image_id,
                     'category_id': category_id,
-                    'segmentation': [],
+                    'segmentation': [[x, y, x+w,y, x+w, y+h, x, y+h]],
                     'bbox': [x, y, w, h],
                     'ignore': 0,
                     'iscrowd': 0,
